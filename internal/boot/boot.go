@@ -53,7 +53,7 @@ func Build(ctx context.Context, opts Options) (*control.Controller, error) {
 	if modelName == "" {
 		modelName = cfg.DefaultModel
 	}
-	entry, ok := cfg.Provider(modelName)
+	entry, ok := cfg.ResolveModel(modelName)
 	if !ok {
 		return nil, fmt.Errorf("unknown model %q (configured: %s)", modelName, providerNames(cfg))
 	}
@@ -130,22 +130,24 @@ func Build(ctx context.Context, opts Options) (*control.Controller, error) {
 	cmds, _ := command.Load(config.CommandDirs()...)
 
 	var runner agent.Runner = executor
-	label := modelName
+	label := entry.Model
 
 	// Two-model collaboration: a distinct planner_model wraps the executor in a
 	// Coordinator with its own session, kept separate for cache stability.
-	if pm := cfg.Agent.PlannerModel; pm != "" && pm != modelName {
-		pe, ok := cfg.Provider(pm)
+	if pm := cfg.Agent.PlannerModel; pm != "" {
+		pe, ok := cfg.ResolveModel(pm)
 		if !ok {
 			return nil, fmt.Errorf("planner_model %q is not a configured provider", pm)
 		}
-		plannerProv, err := NewProvider(pe)
-		if err != nil {
-			return nil, fmt.Errorf("planner %q: %w", pm, err)
+		if pe.Model != entry.Model {
+			plannerProv, err := NewProvider(pe)
+			if err != nil {
+				return nil, fmt.Errorf("planner %q: %w", pm, err)
+			}
+			plannerSess := agent.NewSession(agent.DefaultPlannerPrompt)
+			runner = agent.NewCoordinator(plannerProv, plannerSess, pe.Price, executor, cfg.Agent.Temperature, opts.Sink)
+			label = entry.Model + " + planner " + pe.Model
 		}
-		plannerSess := agent.NewSession(agent.DefaultPlannerPrompt)
-		runner = agent.NewCoordinator(plannerProv, plannerSess, pe.Price, executor, cfg.Agent.Temperature, opts.Sink)
-		label = modelName + " + planner " + pm
 	}
 
 	return control.New(control.Options{

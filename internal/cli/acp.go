@@ -81,7 +81,7 @@ type acpFactory struct {
 // are released via the controller's Cleanup, run on ctrl.Close().
 func (f *acpFactory) NewSession(ctx context.Context, p acp.SessionParams) (*control.Controller, error) {
 	cfg := f.cfg
-	entry, ok := cfg.Provider(f.model)
+	entry, ok := cfg.ResolveModel(f.model)
 	if !ok {
 		return nil, fmt.Errorf("unknown model %q", f.model)
 	}
@@ -144,21 +144,23 @@ func (f *acpFactory) NewSession(ctx context.Context, p acp.SessionParams) (*cont
 	cmds, _ := command.Load(config.CommandDirs()...)
 
 	var runner agent.Runner = executor
-	label := f.model
-	if pm := cfg.Agent.PlannerModel; pm != "" && pm != f.model {
-		pe, ok := cfg.Provider(pm)
+	label := entry.Model
+	if pm := cfg.Agent.PlannerModel; pm != "" {
+		pe, ok := cfg.ResolveModel(pm)
 		if !ok {
 			cleanup()
 			return nil, fmt.Errorf("planner_model %q is not a configured provider", pm)
 		}
-		plannerProv, err := boot.NewProvider(pe)
-		if err != nil {
-			cleanup()
-			return nil, fmt.Errorf("planner %q: %w", pm, err)
+		if pe.Model != entry.Model {
+			plannerProv, err := boot.NewProvider(pe)
+			if err != nil {
+				cleanup()
+				return nil, fmt.Errorf("planner %q: %w", pm, err)
+			}
+			plannerSess := agent.NewSession(agent.DefaultPlannerPrompt)
+			runner = agent.NewCoordinator(plannerProv, plannerSess, pe.Price, executor, cfg.Agent.Temperature, p.Sink)
+			label = entry.Model + " + planner " + pe.Model
 		}
-		plannerSess := agent.NewSession(agent.DefaultPlannerPrompt)
-		runner = agent.NewCoordinator(plannerProv, plannerSess, pe.Price, executor, cfg.Agent.Temperature, p.Sink)
-		label = f.model + " + planner " + pm
 	}
 
 	return control.New(control.Options{

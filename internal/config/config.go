@@ -98,10 +98,46 @@ type ProviderEntry struct {
 	Name          string            `toml:"name"`
 	Kind          string            `toml:"kind"`
 	BaseURL       string            `toml:"base_url"`
-	Model         string            `toml:"model"`
+	Model         string            `toml:"model"`   // a single model (back-compat)
+	Models        []string          `toml:"models"`  // a vendor's model list (one base_url/key, many models)
+	Default       string            `toml:"default"` // default model when Models is set (else Models[0])
 	APIKeyEnv     string            `toml:"api_key_env"`
 	ContextWindow int               `toml:"context_window"`
 	Price         *provider.Pricing `toml:"price"`
+}
+
+// ModelList returns the models this provider exposes: the explicit `models` list,
+// or the single `model` as a one-element list (back-compat). Empty if neither set.
+func (e *ProviderEntry) ModelList() []string {
+	if len(e.Models) > 0 {
+		return e.Models
+	}
+	if e.Model != "" {
+		return []string{e.Model}
+	}
+	return nil
+}
+
+// DefaultModel returns the provider's default model: the explicit `default`, else
+// the first of ModelList.
+func (e *ProviderEntry) DefaultModel() string {
+	if e.Default != "" {
+		return e.Default
+	}
+	if l := e.ModelList(); len(l) > 0 {
+		return l[0]
+	}
+	return ""
+}
+
+// HasModel reports whether m is one of the provider's models.
+func (e *ProviderEntry) HasModel(m string) bool {
+	for _, x := range e.ModelList() {
+		if x == m {
+			return true
+		}
+	}
+	return false
 }
 
 // ToolsConfig selects which built-in tools are enabled. Empty means all of them.
@@ -289,6 +325,45 @@ func (c *Config) Provider(name string) (*ProviderEntry, bool) {
 	return nil, false
 }
 
+// ResolveModel resolves a model reference to a provider entry whose Model is the
+// selected model string (a copy, so the config's lists stay intact). It accepts:
+//   - "provider/model" — that exact model under that provider;
+//   - a provider name   — the provider's default model;
+//   - a bare model name — the (first) provider that lists it.
+//
+// The returned entry is ready to build a provider from (NewProvider reads .Model),
+// so a single "vendor with many models" entry yields one instance per model
+// without duplicating base_url/api_key_env. Single-`model` entries still resolve
+// by provider name, keeping older configs working unchanged.
+func (c *Config) ResolveModel(ref string) (*ProviderEntry, bool) {
+	if ref == "" {
+		return nil, false
+	}
+	// "provider/model"
+	if prov, model, ok := strings.Cut(ref, "/"); ok {
+		if e, found := c.Provider(prov); found && e.HasModel(model) {
+			cp := *e
+			cp.Model = model
+			return &cp, true
+		}
+	}
+	// a provider name → its default model
+	if e, found := c.Provider(ref); found {
+		cp := *e
+		cp.Model = e.DefaultModel()
+		return &cp, true
+	}
+	// a bare model name → the provider that lists it
+	for i := range c.Providers {
+		if c.Providers[i].HasModel(ref) {
+			cp := c.Providers[i]
+			cp.Model = ref
+			return &cp, true
+		}
+	}
+	return nil, false
+}
+
 // APIKey resolves the entry's API key from its api_key_env.
 func (e *ProviderEntry) APIKey() string {
 	if e.APIKeyEnv == "" {
@@ -314,7 +389,7 @@ func (c *Config) ResolveSystemPrompt() (string, error) {
 
 // Validate checks that the selected model's provider is usable.
 func (c *Config) Validate(model string) error {
-	e, ok := c.Provider(model)
+	e, ok := c.ResolveModel(model)
 	if !ok {
 		return fmt.Errorf("unknown model %q (configured: %s)", model, c.providerNames())
 	}

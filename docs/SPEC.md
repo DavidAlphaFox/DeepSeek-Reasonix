@@ -83,6 +83,15 @@ type Config struct {
 - **DeepSeek and MiMo are not code — they are config instances** of `kind = "openai"`,
   differing only in `base_url` / `model` / `api_key_env`. Adding another OpenAI-
   compatible model is a config edit, not a code change.
+- **A provider is a vendor endpoint** (one `base_url` + `api_key_env`) that offers
+  one or more models. An entry declares either a single `model = "..."` or a
+  `models = ["...", "..."]` list (with an optional `default`); the list form lets
+  one vendor expose several models without re-declaring the endpoint/key — picking
+  a model reuses the same connection. A **model reference** (`default_model`, the
+  `--model` flag, the desktop switcher) resolves via `Config.ResolveModel`, which
+  accepts a provider name (→ its default model), a bare model name, or an explicit
+  `provider/model`. `context_window` / `price` are per-provider, so models that
+  need distinct values stay separate single-`model` entries.
 - Streaming tool-call deltas are accumulated by index inside the provider; only
   complete `ToolCall`s are emitted.
 
@@ -319,7 +328,7 @@ are never stored in config files. A `.env` in the working directory is loaded if
 present.
 
 ```toml
-default_model = "deepseek-flash"   # the executor
+default_model = "deepseek"   # provider name (→ its default model) or "provider/model"
 # language    = "zh"                # ui language tag; empty = auto-detect from $LANG / $REASONIX_LANG
 
 [agent]
@@ -328,21 +337,17 @@ max_steps     = 25
 temperature   = 0.0
 # planner_model = "mimo"   # optional: two-model collaboration (low-frequency planner)
 
+# A vendor endpoint exposing several models under one base_url/key.
 [[providers]]
-name           = "deepseek-flash"
+name           = "deepseek"
 kind           = "openai"
 base_url       = "https://api.deepseek.com"
-model          = "deepseek-v4-flash"
+models         = ["deepseek-v4-flash", "deepseek-v4-pro"]
+default        = "deepseek-v4-flash"   # optional; defaults to models[0]
 api_key_env    = "DEEPSEEK_API_KEY"
 context_window = 1000000   # tokens; harness compacts older history near this limit (0 disables)
 
-[[providers]]
-name        = "deepseek-pro"
-kind        = "openai"
-base_url    = "https://api.deepseek.com"
-model       = "deepseek-v4-pro"
-api_key_env = "DEEPSEEK_API_KEY"
-
+# A single-model entry (use when a model needs its own base_url/context_window/price).
 [[providers]]
 name        = "mimo-pro"
 kind        = "openai"
