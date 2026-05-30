@@ -3,7 +3,7 @@ package agent
 import (
 	"context"
 	"encoding/json"
-	"io"
+	"reasonix/internal/event"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -58,15 +58,13 @@ func TestTruncateToolOutputRuneBoundaries(t *testing.T) {
 	}
 }
 
-// TestPrintFinishReasonWarning only fires for abnormal terminations. Normal
-// stops are silent so the per-turn line stays clean.
-func TestPrintFinishReasonWarning(t *testing.T) {
+// TestFinishReasonMessage only yields a warning for abnormal terminations.
+// Normal stops are silent (ok=false) so the per-turn line stays clean.
+func TestFinishReasonMessage(t *testing.T) {
 	silent := []string{"", "stop", "tool_calls"}
 	for _, r := range silent {
-		var b strings.Builder
-		printFinishReasonWarning(&b, &provider.Usage{FinishReason: r})
-		if b.Len() != 0 {
-			t.Errorf("finish_reason=%q should be silent, got %q", r, b.String())
+		if msg, ok := finishReasonMessage(&provider.Usage{FinishReason: r}); ok {
+			t.Errorf("finish_reason=%q should be silent, got %q", r, msg)
 		}
 	}
 	loud := map[string]string{
@@ -75,10 +73,9 @@ func TestPrintFinishReasonWarning(t *testing.T) {
 		"repetition_truncation": "repetition",
 	}
 	for reason, fragment := range loud {
-		var b strings.Builder
-		printFinishReasonWarning(&b, &provider.Usage{FinishReason: reason})
-		if !strings.Contains(b.String(), fragment) {
-			t.Errorf("finish_reason=%q: got %q, want fragment %q", reason, b.String(), fragment)
+		msg, ok := finishReasonMessage(&provider.Usage{FinishReason: reason})
+		if !ok || !strings.Contains(msg, fragment) {
+			t.Errorf("finish_reason=%q: got (%q, %v), want fragment %q", reason, msg, ok, fragment)
 		}
 	}
 }
@@ -154,7 +151,7 @@ func TestExecuteBatchParallelReadOnly(t *testing.T) {
 	reg.Add(fakeTool{name: "b", readOnly: true, delay: delay, calls: &calls})
 	reg.Add(fakeTool{name: "c", readOnly: true, delay: delay, calls: &calls})
 
-	a := New(nil, reg, NewSession(""), Options{}, io.Discard)
+	a := New(nil, reg, NewSession(""), Options{}, event.Discard)
 
 	start := time.Now()
 	results := a.executeBatch(context.Background(), []provider.ToolCall{{Name: "a"}, {Name: "b"}, {Name: "c"}})
@@ -180,7 +177,7 @@ func TestExecuteBatchSerialOnWrite(t *testing.T) {
 	reg.Add(fakeTool{name: "ro", readOnly: true, delay: delay})
 	reg.Add(fakeTool{name: "rw", readOnly: false, delay: delay})
 
-	a := New(nil, reg, NewSession(""), Options{}, io.Discard)
+	a := New(nil, reg, NewSession(""), Options{}, event.Discard)
 
 	start := time.Now()
 	a.executeBatch(context.Background(), []provider.ToolCall{{Name: "ro"}, {Name: "rw"}, {Name: "ro"}})

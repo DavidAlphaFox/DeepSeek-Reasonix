@@ -9,6 +9,7 @@ import (
 	"strings"
 	"time"
 
+	"reasonix/internal/event"
 	"reasonix/internal/provider"
 )
 
@@ -44,7 +45,7 @@ func (a *Agent) maybeCompact(ctx context.Context, u *provider.Usage) {
 		return
 	}
 	if err := a.compact(ctx); err != nil {
-		fmt.Fprintf(a.out, "  · compaction skipped: %v\n", err)
+		a.sink.Emit(event.Event{Kind: event.Notice, Level: event.LevelInfo, Text: fmt.Sprintf("compaction skipped: %v", err)})
 	}
 }
 
@@ -82,11 +83,11 @@ func (a *Agent) compact(ctx context.Context) error {
 	compacted = append(compacted, msgs[start:]...)
 	a.session.Messages = compacted
 
-	note := fmt.Sprintf("  · compacted %d messages → summary", len(region))
+	note := fmt.Sprintf("compacted %d messages → summary", len(region))
 	if archived != "" {
 		note += " (archived " + archived + ")"
 	}
-	fmt.Fprintln(a.out, note)
+	a.sink.Emit(event.Event{Kind: event.Notice, Level: event.LevelInfo, Text: note})
 	return nil
 }
 

@@ -4,9 +4,9 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"io"
 	"strings"
 
+	"reasonix/internal/event"
 	"reasonix/internal/provider"
 	"reasonix/internal/tool"
 )
@@ -139,7 +139,7 @@ func (t *TaskTool) Execute(ctx context.Context, args json.RawMessage) (string, e
 		Gate:          t.gate,
 		ContextWindow: t.contextWindow,
 		ArchiveDir:    t.archiveDir,
-	}, io.Discard)
+	}, event.Discard)
 
 	if err := subAgent.Run(ctx, p.Prompt); err != nil {
 		return "", fmt.Errorf("sub-agent: %w", err)

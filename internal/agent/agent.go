@@ -4,11 +4,11 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"io"
 	"strings"
 	"sync"
 	"unicode/utf8"
 
+	"reasonix/internal/event"
 	"reasonix/internal/provider"
 	"reasonix/internal/tool"
 )
@@ -23,7 +23,7 @@ const maxToolOutputBytes = 32 * 1024
 // applied only after a turn's text stream completes, so the user sees raw
 // markdown stream live, then a single redraw replaces it with formatted
 // output. The renderer is intentionally interface-shaped so the agent stays
-// independent of the cli's markdown library choice.
+// independent of the cli's markdown library choice. Consumed by TextSink.
 type Renderer interface {
 	Render(text string) string
 }
@@ -48,12 +48,12 @@ type Agent struct {
 	maxSteps    int
 	temperature float64
 	pricing     *provider.Pricing
-	out         io.Writer
 
-	// Optional post-stream redraw of assistant text as styled markdown. nil
-	// keeps the raw stream as-is (useful for non-tty / piped output and tests).
-	renderer  Renderer
-	termWidth int
+	// sink receives the turn's typed event stream (reasoning/text deltas, tool
+	// dispatch/results, usage, notices). The agent no longer formats output
+	// itself — a frontend's Sink decides how to render. Never nil; New defaults
+	// it to event.Discard.
+	sink event.Sink
 
 	// lastUsage caches the most recent per-turn telemetry the provider
 	// reported so the CLI can expose a context gauge without re-scraping the
@@ -122,13 +122,6 @@ type Options struct {
 	Temperature float64
 	Pricing     *provider.Pricing // optional, for per-turn cost display
 
-	// Renderer, when set, replaces the streamed raw text with styled markdown
-	// after each assistant turn. TermWidth is the column count used both for
-	// the renderer's wrapping and for counting how many rows the raw stream
-	// occupied (so the cursor lands on the right line before redrawing).
-	Renderer  Renderer
-	TermWidth int
-
 	// Gate is the per-call permission gate. nil disables gating.
 	Gate Gate
 
@@ -140,8 +133,9 @@ type Options struct {
 	ArchiveDir    string
 }
 
-// New constructs an Agent. MaxSteps <= 0 defaults to 25.
-func New(prov provider.Provider, tools *tool.Registry, session *Session, opts Options, out io.Writer) *Agent {
+// New constructs an Agent. MaxSteps <= 0 defaults to 25. A nil sink is replaced
+// with event.Discard so the agent can always emit unconditionally.
+func New(prov provider.Provider, tools *tool.Registry, session *Session, opts Options, sink event.Sink) *Agent {
 	if opts.MaxSteps <= 0 {
 		opts.MaxSteps = 25
 	}
@@ -151,6 +145,9 @@ func New(prov provider.Provider, tools *tool.Registry, session *Session, opts Op
 	if opts.RecentKeep <= 0 {
 		opts.RecentKeep = defaultRecentKeep
 	}
+	if sink == nil {
+		sink = event.Discard
+	}
 	return &Agent{
 		prov:          prov,
 		tools:         tools,
@@ -158,9 +155,7 @@ func New(prov provider.Provider, tools *tool.Registry, session *Session, opts Op
 		maxSteps:      opts.MaxSteps,
 		temperature:   opts.Temperature,
 		pricing:       opts.Pricing,
-		out:           out,
-		renderer:      opts.Renderer,
-		termWidth:     opts.TermWidth,
+		sink:          sink,
 		gate:          opts.Gate,
 		contextWindow: opts.ContextWindow,
 		compactRatio:  opts.CompactRatio,
@@ -172,6 +167,7 @@ func New(prov provider.Provider, tools *tool.Registry, session *Session, opts Op
 // Run appends the user input and runs the loop until the model stops requesting
 // tools or maxSteps is reached.
 func (a *Agent) Run(ctx context.Context, input string) error {
+	a.sink.Emit(event.Event{Kind: event.TurnStarted})
 	a.session.Add(provider.Message{Role: provider.RoleUser, Content: input})
 
 	for step := 0; step < a.maxSteps; step++ {
@@ -179,8 +175,12 @@ func (a *Agent) Run(ctx context.Context, input string) error {
 		if err != nil {
 			return err
 		}
-		printUsage(a.out, usage, a.pricing)
-		printFinishReasonWarning(a.out, usage)
+		if usage != nil && usage.TotalTokens > 0 {
+			a.sink.Emit(event.Event{Kind: event.Usage, Usage: usage, Pricing: a.pricing})
+		}
+		if msg, ok := finishReasonMessage(usage); ok {
+			a.sink.Emit(event.Event{Kind: event.Notice, Level: event.LevelWarn, Text: msg})
+		}
 
 		// Round-trip reasoning_content on the assistant turn so multi-turn
 		// thinking chains stay coherent (MiMo / DeepSeek-reasoner ask for this).
@@ -212,11 +212,11 @@ func (a *Agent) Run(ctx context.Context, input string) error {
 	return fmt.Errorf("reached max steps (%d) without completing", a.maxSteps)
 }
 
-// stream runs one completion, printing text deltas live and collecting complete
-// tool calls. Reasoning deltas (thinking-mode chain-of-thought) are shown in
-// muted prose under a "thinking" header so the user can follow the model's
-// reasoning without confusing it with the final answer, and accumulated so the
-// caller can round-trip it on the next turn.
+// stream runs one completion, emitting reasoning and text deltas as typed
+// events and collecting complete tool calls. A Message event closes the text
+// stream so a sink can re-render the streamed raw text as styled markdown. The
+// accumulated text and reasoning are also returned so the caller can round-trip
+// reasoning on the next turn.
 func (a *Agent) stream(ctx context.Context) (string, string, []provider.ToolCall, *provider.Usage, error) {
 	ch, err := a.prov.Stream(ctx, provider.Request{
 		Messages:    a.session.Messages,
@@ -230,22 +230,14 @@ func (a *Agent) stream(ctx context.Context) (string, string, []provider.ToolCall
 	var text, reasoning strings.Builder
 	var calls []provider.ToolCall
 	var usage *provider.Usage
-	wroteReasoningHeader := false
 	for chunk := range ch {
 		switch chunk.Type {
 		case provider.ChunkReasoning:
-			if !wroteReasoningHeader {
-				fmt.Fprintln(a.out, dimText("  ▎ thinking"))
-				wroteReasoningHeader = true
-			}
 			reasoning.WriteString(chunk.Text)
-			fmt.Fprint(a.out, dimText(chunk.Text))
+			a.sink.Emit(event.Event{Kind: event.Reasoning, Text: chunk.Text})
 		case provider.ChunkText:
-			if wroteReasoningHeader && text.Len() == 0 {
-				fmt.Fprintln(a.out) // separate the reasoning block from the answer
-			}
 			text.WriteString(chunk.Text)
-			fmt.Fprint(a.out, chunk.Text)
+			a.sink.Emit(event.Event{Kind: event.Text, Text: chunk.Text})
 		case provider.ChunkToolCall:
 			calls = append(calls, *chunk.ToolCall)
 		case provider.ChunkUsage:
@@ -255,51 +247,38 @@ func (a *Agent) stream(ctx context.Context) (string, string, []provider.ToolCall
 			return "", "", nil, nil, chunk.Err
 		}
 	}
-	// If a renderer is wired in, replace the raw streamed text with styled
-	// markdown: move the cursor back to the row where text streaming began,
-	// clear from there to the end of the screen, and re-emit the rendered
-	// version. Reasoning above the text stays untouched. Very long messages
-	// keep the raw stream — the move-up would otherwise sail past the screen
-	// top and leave artifacts.
-	if text.Len() > 0 && a.renderer != nil {
-		if moved := streamedRows(text.String(), a.termWidth); moved < 200 {
-			if moved == 0 {
-				fmt.Fprint(a.out, "\r\033[0J")
-			} else {
-				fmt.Fprintf(a.out, "\r\033[%dA\033[0J", moved)
-			}
-			fmt.Fprint(a.out, a.renderer.Render(text.String()))
-			return text.String(), reasoning.String(), calls, usage, nil
-		}
-	}
+	// Close the text stream: a sink may re-render the streamed raw text as
+	// styled markdown now that it is complete. Reasoning rides along so the sink
+	// has the full chain if it wants it.
 	if text.Len() > 0 || reasoning.Len() > 0 {
-		fmt.Fprintln(a.out)
+		a.sink.Emit(event.Event{Kind: event.Message, Text: text.String(), Reasoning: reasoning.String()})
 	}
 	return text.String(), reasoning.String(), calls, usage, nil
 }
 
-// dimText wraps s in the ANSI dim SGR sequence so reasoning streams visually
-// recede from the final answer. Lives here to avoid importing the cli style
-// helpers — the agent must stay independent of CLI rendering choices, so this
-// uses raw codes the writer can strip if needed.
-func dimText(s string) string { return "\x1b[2m" + s + "\x1b[0m" }
-
-// executeBatch dispatches one model turn's tool calls. The schedule lines
-// "-> tool args" are always printed in call order up front so the timeline
-// reads chronologically. Calls fan out across goroutines only when every
+// executeBatch dispatches one model turn's tool calls. A ToolDispatch event is
+// emitted for every call up front, in call order, so a frontend can show the
+// timeline chronologically. Calls fan out across goroutines only when every
 // call's tool is ReadOnly (canParallelise); a single non-ReadOnly call drops
-// the whole batch back to sequential to preserve write/read ordering and
-// keep effects deterministic. Truncation notices, if any, print serially in
-// call order after the dispatch completes.
+// the whole batch back to sequential to preserve write/read ordering. ToolResult
+// events are emitted after the batch in call order, so emission stays serial
+// even when execution parallelised.
 func (a *Agent) executeBatch(ctx context.Context, calls []provider.ToolCall) []string {
 	for _, c := range calls {
-		fmt.Fprintf(a.out, "  -> %s %s\n", c.Name, compactArgs(c.Arguments))
+		t, ok := a.tools.Get(c.Name)
+		a.sink.Emit(event.Event{Kind: event.ToolDispatch, Tool: event.Tool{
+			ID:       c.ID,
+			Name:     c.Name,
+			Args:     c.Arguments,
+			ReadOnly: ok && t.ReadOnly(),
+		}})
 	}
 
 	results := make([]string, len(calls))
-	notices := make([]string, len(calls))
+	outcomes := make([]toolOutcome, len(calls))
 	run := func(i int) {
-		results[i], notices[i] = a.executeOne(ctx, calls[i])
+		outcomes[i] = a.executeOne(ctx, calls[i])
+		results[i] = outcomes[i].output
 	}
 
 	if canParallelise(a.tools, calls) && len(calls) > 1 {
@@ -323,39 +302,72 @@ func (a *Agent) executeBatch(ctx context.Context, calls []provider.ToolCall) []s
 		}
 	}
 
-	for _, n := range notices {
-		if n != "" {
-			fmt.Fprintln(a.out, n)
+	for i, c := range calls {
+		o := outcomes[i]
+		t, ok := a.tools.Get(c.Name)
+		a.sink.Emit(event.Event{Kind: event.ToolResult, Tool: event.Tool{
+			ID:        c.ID,
+			Name:      c.Name,
+			Args:      c.Arguments,
+			Output:    o.output,
+			Err:       o.blockMsg,
+			ReadOnly:  ok && t.ReadOnly(),
+			Truncated: o.truncated,
+		}})
+		if o.truncated && o.truncMsg != "" {
+			a.sink.Emit(event.Event{Kind: event.Notice, Level: event.LevelInfo, Text: o.truncMsg})
 		}
 	}
 	return results
 }
 
-// executeOne runs a single tool call and returns (resultText, noticeText).
-// It is pure with respect to a.out — the caller is responsible for the live
-// schedule line, so this is safe to invoke from parallel goroutines.
-func (a *Agent) executeOne(ctx context.Context, call provider.ToolCall) (string, string) {
+// toolOutcome is one tool call's result, split into the model-facing output and
+// the display-facing notice bits. blockMsg is set (without the "name " prefix)
+// when the call was blocked, so a sink can render "⊘ name <blockMsg>"; truncMsg
+// is set (without the "· " prefix) when the output was head+tailed.
+type toolOutcome struct {
+	output    string
+	blocked   bool
+	blockMsg  string
+	truncated bool
+	truncMsg  string
+}
+
+// executeOne runs a single tool call. It is pure with respect to the event sink
+// — the caller emits ToolDispatch/ToolResult — so it is safe to invoke from
+// parallel goroutines.
+func (a *Agent) executeOne(ctx context.Context, call provider.ToolCall) toolOutcome {
 	t, ok := a.tools.Get(call.Name)
 	if !ok {
-		return fmt.Sprintf("error: unknown tool %q", call.Name), ""
+		return toolOutcome{output: fmt.Sprintf("error: unknown tool %q", call.Name)}
 	}
 	if a.planMode && !t.ReadOnly() {
-		return fmt.Sprintf("blocked: %q is a writer tool and plan mode is read-only — propose the change in your final answer instead. The user will toggle plan mode off (Tab) to execute.", call.Name), ""
+		return toolOutcome{output: fmt.Sprintf("blocked: %q is a writer tool and plan mode is read-only — propose the change in your final answer instead. The user will toggle plan mode off (Tab) to execute.", call.Name)}
 	}
 	if a.gate != nil {
 		allow, reason, err := a.gate.Check(ctx, call.Name, json.RawMessage(call.Arguments), t.ReadOnly())
 		if err != nil {
-			return fmt.Sprintf("blocked: %s (%v)", reason, err), fmt.Sprintf("  ⊘ %s blocked: %v", call.Name, err)
+			return toolOutcome{
+				output:   fmt.Sprintf("blocked: %s (%v)", reason, err),
+				blocked:  true,
+				blockMsg: fmt.Sprintf("blocked: %v", err),
+			}
 		}
 		if !allow {
-			return "blocked: " + reason, fmt.Sprintf("  ⊘ %s blocked by permission policy", call.Name)
+			return toolOutcome{
+				output:   "blocked: " + reason,
+				blocked:  true,
+				blockMsg: "blocked by permission policy",
+			}
 		}
 	}
 	result, err := t.Execute(ctx, json.RawMessage(call.Arguments))
 	if err != nil {
-		return truncateToolOutput(fmt.Sprintf("error: %v\n%s", err, result))
+		body, truncMsg := truncateToolOutput(fmt.Sprintf("error: %v\n%s", err, result))
+		return toolOutcome{output: body, truncated: truncMsg != "", truncMsg: truncMsg}
 	}
-	return truncateToolOutput(result)
+	body, truncMsg := truncateToolOutput(result)
+	return toolOutcome{output: body, truncated: truncMsg != "", truncMsg: truncMsg}
 }
 
 // canParallelise returns true iff every call targets a known, ReadOnly tool.
@@ -374,8 +386,7 @@ func canParallelise(r *tool.Registry, calls []provider.ToolCall) bool {
 // truncateToolOutput head+tails s when it exceeds maxToolOutputBytes, slicing
 // on rune boundaries so we never split a multibyte glyph. Returns the possibly
 // trimmed body plus a one-line user-facing notice when truncation happened
-// (empty when it didn't), so callers can render notices in deterministic
-// order even when called from parallel goroutines.
+// (empty when it didn't, without the "· " display prefix).
 func truncateToolOutput(s string) (string, string) {
 	if len(s) <= maxToolOutputBytes {
 		return s, ""
@@ -384,7 +395,7 @@ func truncateToolOutput(s string) (string, string) {
 	head := snapToRuneBoundary(s, 0, keep)
 	tail := snapToRuneBoundary(s, len(s)-keep, len(s))
 	omitted := len(s) - len(head) - len(tail)
-	notice := fmt.Sprintf("  · tool output truncated: %d of %d bytes elided", omitted, len(s))
+	notice := fmt.Sprintf("tool output truncated: %d of %d bytes elided", omitted, len(s))
 	body := head + fmt.Sprintf("\n\n…[truncated %d of %d bytes — rerun with narrower args to see the middle]…\n\n", omitted, len(s)) + tail
 	return body, notice
 }
@@ -401,69 +412,21 @@ func snapToRuneBoundary(s string, lo, hi int) string {
 	return s[lo:hi]
 }
 
-func compactArgs(s string) string {
-	s = strings.TrimSpace(s)
-	r := []rune(s)
-	if len(r) > 120 {
-		return string(r[:120]) + "..."
-	}
-	return s
-}
-
-// printFinishReasonWarning emits a one-line notice when the model stopped for
-// a non-normal reason — length truncation, content filter, or repetition
-// truncation (MiMo-specific). "stop" / "tool_calls" are the normal terminations
-// and produce no output.
-func printFinishReasonWarning(w io.Writer, u *provider.Usage) {
+// finishReasonMessage maps an abnormal finish_reason to a one-line warning,
+// returning ok=false for the normal terminations ("stop", "tool_calls") and a
+// nil usage. The sink renders the message; the "! " prefix is presentation.
+func finishReasonMessage(u *provider.Usage) (string, bool) {
 	if u == nil {
-		return
+		return "", false
 	}
-	var msg string
 	switch u.FinishReason {
 	case "length":
-		msg = "response truncated: hit max output tokens"
+		return "response truncated: hit max output tokens", true
 	case "content_filter":
-		msg = "response blocked by content filter"
+		return "response blocked by content filter", true
 	case "repetition_truncation":
-		msg = "response truncated: model repetition detected"
+		return "response truncated: model repetition detected", true
 	default:
-		return
+		return "", false
 	}
-	fmt.Fprintln(w, "  ! "+msg)
-}
-
-// printUsage prints a one-line token/cache summary — the key signal for the
-// cache-first design. Cache is reported as absolute "(N cached / M new)" so a
-// turn that adds a lot of fresh content (e.g. a long tool result) doesn't read
-// as "cache broke" the way a falling percentage would; the cached prefix is
-// still hitting, the denominator just grew. Thinking-capable models also
-// report reasoning_tokens, a subset of the completion count we display so
-// users can see the cost of the chain-of-thought. No-op when usage is unset.
-func printUsage(w io.Writer, u *provider.Usage, p *provider.Pricing) {
-	if u == nil || u.TotalTokens == 0 {
-		return
-	}
-	cacheCol := ""
-	if u.PromptTokens > 0 {
-		cached := u.CacheHitTokens
-		fresh := u.CacheMissTokens
-		if fresh == 0 {
-			// Derive when the provider only reported the hit half; the miss
-			// equals the remaining prompt unless something underflows.
-			if d := u.PromptTokens - cached; d > 0 {
-				fresh = d
-			}
-		}
-		cacheCol = fmt.Sprintf(" (%d cached / %d new)", cached, fresh)
-	}
-	reasoning := ""
-	if u.ReasoningTokens > 0 {
-		reasoning = fmt.Sprintf(" (%d reasoning)", u.ReasoningTokens)
-	}
-	cost := ""
-	if p != nil {
-		cost = fmt.Sprintf(" · %s%.4f", p.Symbol(), p.Cost(u))
-	}
-	fmt.Fprintf(w, "  · %d tok · in %d%s · out %d%s%s\n",
-		u.TotalTokens, u.PromptTokens, cacheCol, u.CompletionTokens, reasoning, cost)
 }

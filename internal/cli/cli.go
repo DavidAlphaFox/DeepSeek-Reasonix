@@ -236,17 +236,21 @@ func setup(ctx context.Context, modelName string, maxStepsOverride int, requireK
 		renderer = newMarkdownRenderer(termW)
 	}
 
+	// The agent emits a typed event stream; TextSink renders it to ANSI on out,
+	// reproducing the old inline output (markdown redraw included, when a
+	// renderer is set). The chat TUI feeds the same sink through a channel writer
+	// for now; a typed-event TUI sink lands in a later step.
+	sink := agent.NewTextSink(out, renderer, termW)
+
 	execSess := agent.NewSession(sysPrompt)
 	executor := agent.New(execProv, reg, execSess, agent.Options{
 		MaxSteps:      maxSteps,
 		Temperature:   cfg.Agent.Temperature,
 		Pricing:       entry.Price,
-		Renderer:      renderer,
-		TermWidth:     termW,
 		Gate:          headlessGate,
 		ContextWindow: entry.ContextWindow,
 		ArchiveDir:    config.ArchiveDir(),
-	}, out)
+	}, sink)
 
 	// Custom slash commands (.reasonix/commands + user dir). Best-effort: a malformed
 	// file is skipped, and a load error never blocks the session.
@@ -267,7 +271,7 @@ func setup(ctx context.Context, modelName string, maxStepsOverride int, requireK
 			return nil, fmt.Errorf("planner %q: %w", pm, err)
 		}
 		plannerSess := agent.NewSession(agent.DefaultPlannerPrompt)
-		runner = agent.NewCoordinator(plannerProv, plannerSess, pe.Price, executor, cfg.Agent.Temperature, out)
+		runner = agent.NewCoordinator(plannerProv, plannerSess, pe.Price, executor, cfg.Agent.Temperature, sink)
 		label = modelName + " + planner " + pm
 	}
 

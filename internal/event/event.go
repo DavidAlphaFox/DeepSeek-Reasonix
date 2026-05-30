@@ -1,0 +1,97 @@
+// Package event defines the typed event stream the agent emits as it runs a
+// turn, and the Sink it emits to. It decouples "what happened" (the model
+// produced reasoning, a tool was dispatched, a turn used N tokens) from "how to
+// show it" (ANSI scrollback in a terminal, a card in a webview).
+//
+// The agent depends only on Sink; each frontend implements one. The chat TUI
+// renders events to its scrollback; a headless run renders them to plain ANSI
+// on stdout; a future GUI/serve transport forwards them to a webview or
+// websocket. This replaces the old io.Writer contract, where the agent wrote
+// pre-formatted ANSI and the consumer had to re-derive structure by matching
+// line prefixes — fragile, and lossy for any frontend richer than a terminal.
+package event
+
+import "reasonix/internal/provider"
+
+// Kind tags an Event. Read the field(s) documented for that kind.
+type Kind int
+
+const (
+	// TurnStarted marks the start of one top-level Run (one user turn). Sinks
+	// reset any per-turn rendering state on it. Carries no payload.
+	TurnStarted Kind = iota
+	// Reasoning is a thinking-mode reasoning delta (Text). Streamed before the
+	// visible answer; sinks typically render it muted under a "thinking" header.
+	Reasoning
+	// Text is an answer-text delta (Text).
+	Text
+	// Message marks the assistant turn's text as complete: Text holds the full
+	// answer and Reasoning the full chain-of-thought (both already streamed via
+	// the deltas above). A sink may use it to re-render the streamed raw text as
+	// styled markdown; a plain sink can ignore it.
+	Message
+	// ToolDispatch announces a tool call is about to run (Tool: ID/Name/Args/ReadOnly).
+	ToolDispatch
+	// ToolResult reports a finished tool call (Tool: Output/Err/Truncated set).
+	ToolResult
+	// Usage carries per-turn token telemetry (Usage; Pricing optional, for cost).
+	Usage
+	// Notice is an out-of-band message — a warning, truncation, block, or
+	// compaction notice (Level + Text).
+	Notice
+	// Phase marks a coordinator boundary, e.g. planner→executor handoff (Text =
+	// label such as "deepseek · planning").
+	Phase
+)
+
+// Level classifies a Notice so sinks can style or filter it.
+type Level int
+
+const (
+	LevelInfo Level = iota
+	LevelWarn
+)
+
+// Tool describes a tool call for ToolDispatch / ToolResult events. On dispatch
+// only ID/Name/Args/ReadOnly are set; on result Output/Err/Truncated are filled
+// in. Args is the raw JSON arguments — a sink compacts it for display.
+type Tool struct {
+	ID        string
+	Name      string
+	Args      string
+	Output    string // ToolResult: the result text fed to the model
+	Err       string // ToolResult: non-empty when the call failed or was blocked
+	ReadOnly  bool
+	Truncated bool // ToolResult: Output was head+tailed before display/model
+}
+
+// Event is one increment in a turn's event stream. Read the field(s) documented
+// for Kind; the others are zero.
+type Event struct {
+	Kind      Kind
+	Text      string            // Reasoning / Text / Message / Notice / Phase
+	Reasoning string            // Message: the full reasoning chain
+	Tool      Tool              // ToolDispatch / ToolResult
+	Usage     *provider.Usage   // Usage
+	Pricing   *provider.Pricing // Usage: for cost display (nil = omit cost)
+	Level     Level             // Notice
+}
+
+// Sink consumes a turn's events. The agent calls Emit serially from its run
+// loop (tool execution may fan out across goroutines, but emission does not),
+// so an implementation need not be safe for concurrent Emit. Emit must not
+// block indefinitely — a channel-backed sink should be buffered or drained by
+// a live reader.
+type Sink interface {
+	Emit(Event)
+}
+
+// FuncSink adapts a plain function to a Sink.
+type FuncSink func(Event)
+
+// Emit calls the wrapped function.
+func (f FuncSink) Emit(e Event) { f(e) }
+
+// Discard is a Sink that drops every event. Useful in tests and for runs that
+// only care about the final session state.
+var Discard Sink = FuncSink(func(Event) {})

@@ -2,9 +2,9 @@ package agent
 
 import (
 	"context"
-	"io"
 	"os"
 	"path/filepath"
+	"reasonix/internal/event"
 	"strings"
 	"testing"
 
@@ -85,7 +85,7 @@ func TestCompactReplacesHistory(t *testing.T) {
 		{Role: provider.RoleAssistant, Content: "ok"},
 	}}
 	dir := t.TempDir()
-	a := New(prov, tool.NewRegistry(), sess, Options{RecentKeep: 2, ArchiveDir: dir}, io.Discard)
+	a := New(prov, tool.NewRegistry(), sess, Options{RecentKeep: 2, ArchiveDir: dir}, event.Discard)
 
 	if err := a.compact(context.Background()); err != nil {
 		t.Fatalf("compact: %v", err)
@@ -138,7 +138,7 @@ func TestMaybeCompactThreshold(t *testing.T) {
 
 	// Below 80% of the window: untouched.
 	sess := newSess()
-	a := New(&fakeProvider{reply: "s"}, tool.NewRegistry(), sess, Options{ContextWindow: 100, RecentKeep: 2, ArchiveDir: t.TempDir()}, io.Discard)
+	a := New(&fakeProvider{reply: "s"}, tool.NewRegistry(), sess, Options{ContextWindow: 100, RecentKeep: 2, ArchiveDir: t.TempDir()}, event.Discard)
 	a.maybeCompact(context.Background(), &provider.Usage{PromptTokens: 50})
 	if len(sess.Messages) != 7 {
 		t.Errorf("below threshold should not compact, len = %d", len(sess.Messages))
@@ -146,7 +146,7 @@ func TestMaybeCompactThreshold(t *testing.T) {
 
 	// At/above 80%: compacts.
 	sess = newSess()
-	a = New(&fakeProvider{reply: "s"}, tool.NewRegistry(), sess, Options{ContextWindow: 100, RecentKeep: 2, ArchiveDir: t.TempDir()}, io.Discard)
+	a = New(&fakeProvider{reply: "s"}, tool.NewRegistry(), sess, Options{ContextWindow: 100, RecentKeep: 2, ArchiveDir: t.TempDir()}, event.Discard)
 	a.maybeCompact(context.Background(), &provider.Usage{PromptTokens: 90})
 	if len(sess.Messages) >= 7 {
 		t.Errorf("above threshold should compact, len = %d", len(sess.Messages))
@@ -154,7 +154,7 @@ func TestMaybeCompactThreshold(t *testing.T) {
 
 	// No context window: compaction disabled.
 	sess = newSess()
-	a = New(&fakeProvider{reply: "s"}, tool.NewRegistry(), sess, Options{RecentKeep: 2, ArchiveDir: t.TempDir()}, io.Discard)
+	a = New(&fakeProvider{reply: "s"}, tool.NewRegistry(), sess, Options{RecentKeep: 2, ArchiveDir: t.TempDir()}, event.Discard)
 	a.maybeCompact(context.Background(), &provider.Usage{PromptTokens: 1 << 30})
 	if len(sess.Messages) != 7 {
 		t.Errorf("no window should disable compaction, len = %d", len(sess.Messages))

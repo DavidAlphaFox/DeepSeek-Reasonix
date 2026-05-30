@@ -3,9 +3,9 @@ package agent
 import (
 	"context"
 	"fmt"
-	"io"
 	"strings"
 
+	"reasonix/internal/event"
 	"reasonix/internal/provider"
 )
 
@@ -31,29 +31,36 @@ type Coordinator struct {
 	plannerPricing *provider.Pricing
 	executor       *Agent
 	temperature    float64
-	out            io.Writer
+	sink           event.Sink
 }
 
 // NewCoordinator wires a planner provider (with its own session) to an executor.
-func NewCoordinator(planner provider.Provider, plannerSession *Session, plannerPricing *provider.Pricing, executor *Agent, temperature float64, out io.Writer) *Coordinator {
+// sink receives the planner's phase/text/usage events; the executor emits its
+// own events to its own sink (the CLI wires the same sink into both). A nil
+// sink is replaced with event.Discard.
+func NewCoordinator(planner provider.Provider, plannerSession *Session, plannerPricing *provider.Pricing, executor *Agent, temperature float64, sink event.Sink) *Coordinator {
+	if sink == nil {
+		sink = event.Discard
+	}
 	return &Coordinator{
 		planner:        planner,
 		plannerSess:    plannerSession,
 		plannerPricing: plannerPricing,
 		executor:       executor,
 		temperature:    temperature,
-		out:            out,
+		sink:           sink,
 	}
 }
 
 // Run plans with the planner model, then hands the plan to the executor.
 func (c *Coordinator) Run(ctx context.Context, input string) error {
-	fmt.Fprintf(c.out, "[%s · planning]\n", c.planner.Name())
+	c.sink.Emit(event.Event{Kind: event.TurnStarted})
+	c.sink.Emit(event.Event{Kind: event.Phase, Text: c.planner.Name() + " · planning"})
 	plan, err := c.plan(ctx, input)
 	if err != nil {
 		return fmt.Errorf("planner: %w", err)
 	}
-	fmt.Fprintf(c.out, "\n[%s · executing]\n", c.executor.prov.Name())
+	c.sink.Emit(event.Event{Kind: event.Phase, Text: c.executor.prov.Name() + " · executing"})
 	return c.executor.Run(ctx, formatHandoff(input, plan))
 }
 
@@ -76,17 +83,16 @@ func (c *Coordinator) plan(ctx context.Context, input string) (string, error) {
 		switch chunk.Type {
 		case provider.ChunkText:
 			text.WriteString(chunk.Text)
-			fmt.Fprint(c.out, chunk.Text)
+			c.sink.Emit(event.Event{Kind: event.Text, Text: chunk.Text})
 		case provider.ChunkUsage:
 			usage = chunk.Usage
 		case provider.ChunkError:
 			return "", chunk.Err
 		}
 	}
-	if text.Len() > 0 {
-		fmt.Fprintln(c.out)
-	}
-	printUsage(c.out, usage, c.plannerPricing)
+	// Closes the planner's raw text block (no markdown redraw) and prints its
+	// usage line, mirroring the old Fprintln + printUsage tail.
+	c.sink.Emit(event.Event{Kind: event.Usage, Usage: usage, Pricing: c.plannerPricing})
 
 	plan := text.String()
 	c.plannerSess.Add(provider.Message{Role: provider.RoleAssistant, Content: plan})

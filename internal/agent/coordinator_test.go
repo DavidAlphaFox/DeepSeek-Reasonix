@@ -2,7 +2,7 @@ package agent
 
 import (
 	"context"
-	"io"
+	"reasonix/internal/event"
 	"strings"
 	"testing"
 
@@ -50,9 +50,9 @@ func TestCoordinatorHandsPlanToExecutor(t *testing.T) {
 		{Type: provider.ChunkDone},
 	}}
 
-	executor := New(exec, tool.NewRegistry(), NewSession("exec-sys"), Options{}, io.Discard)
+	executor := New(exec, tool.NewRegistry(), NewSession("exec-sys"), Options{}, event.Discard)
 	plannerSess := NewSession("planner-sys")
-	coord := NewCoordinator(planner, plannerSess, nil, executor, 0, io.Discard)
+	coord := NewCoordinator(planner, plannerSess, nil, executor, 0, event.Discard)
 
 	if err := coord.Run(context.Background(), "fix the bug"); err != nil {
 		t.Fatalf("Run: %v", err)

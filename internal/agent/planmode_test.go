@@ -2,7 +2,7 @@ package agent
 
 import (
 	"context"
-	"io"
+	"reasonix/internal/event"
 	"strings"
 	"testing"
 
@@ -18,17 +18,17 @@ func TestPlanModeBlocksWriters(t *testing.T) {
 	reg.Add(fakeTool{name: "read_only_tool", readOnly: true})
 	reg.Add(fakeTool{name: "writer_tool", readOnly: false})
 
-	a := New(nil, reg, NewSession(""), Options{}, io.Discard)
+	a := New(nil, reg, NewSession(""), Options{}, event.Discard)
 	a.SetPlanMode(true)
 
-	ro, _ := a.executeOne(context.Background(), provider.ToolCall{Name: "read_only_tool"})
-	if !strings.Contains(ro, "done") {
-		t.Errorf("read-only tool in plan mode should still run: %q", ro)
+	ro := a.executeOne(context.Background(), provider.ToolCall{Name: "read_only_tool"})
+	if !strings.Contains(ro.output, "done") {
+		t.Errorf("read-only tool in plan mode should still run: %q", ro.output)
 	}
 
-	wr, _ := a.executeOne(context.Background(), provider.ToolCall{Name: "writer_tool"})
-	if !strings.HasPrefix(wr, "blocked:") {
-		t.Errorf("writer tool in plan mode should return a 'blocked:' result, got: %q", wr)
+	wr := a.executeOne(context.Background(), provider.ToolCall{Name: "writer_tool"})
+	if !strings.HasPrefix(wr.output, "blocked:") {
+		t.Errorf("writer tool in plan mode should return a 'blocked:' result, got: %q", wr.output)
 	}
 }
 
@@ -45,7 +45,7 @@ func TestPlanModeDoesNotMutateSystemOrTools(t *testing.T) {
 	reg.Add(fakeTool{name: "read_file", readOnly: true})
 	reg.Add(fakeTool{name: "write_file", readOnly: false})
 
-	a := New(prov, reg, NewSession("STABLE-SYS"), Options{}, io.Discard)
+	a := New(prov, reg, NewSession("STABLE-SYS"), Options{}, event.Discard)
 
 	// Auto-mode round-trip.
 	if err := a.Run(context.Background(), "explore"); err != nil {

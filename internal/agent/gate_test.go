@@ -3,7 +3,7 @@ package agent
 import (
 	"context"
 	"encoding/json"
-	"io"
+	"reasonix/internal/event"
 	"strings"
 	"testing"
 
@@ -34,19 +34,19 @@ func TestGateBlocksDeniedCall(t *testing.T) {
 	reg.Add(fakeTool{name: "read_file", readOnly: true})
 
 	g := &stubGate{deny: map[string]bool{"bash": true}}
-	a := New(nil, reg, NewSession(""), Options{Gate: g}, io.Discard)
+	a := New(nil, reg, NewSession(""), Options{Gate: g}, event.Discard)
 
-	blocked, notice := a.executeOne(context.Background(), provider.ToolCall{Name: "bash", Arguments: `{"command":"rm -rf /"}`})
-	if !strings.HasPrefix(blocked, "blocked:") {
-		t.Errorf("denied call result = %q, want a 'blocked:' result", blocked)
+	blocked := a.executeOne(context.Background(), provider.ToolCall{Name: "bash", Arguments: `{"command":"rm -rf /"}`})
+	if !strings.HasPrefix(blocked.output, "blocked:") {
+		t.Errorf("denied call result = %q, want a 'blocked:' result", blocked.output)
 	}
-	if notice == "" {
-		t.Errorf("denied call should surface a user-facing notice")
+	if !blocked.blocked || blocked.blockMsg == "" {
+		t.Errorf("denied call should surface a user-facing block notice, got %+v", blocked)
 	}
 
-	ok, _ := a.executeOne(context.Background(), provider.ToolCall{Name: "read_file", Arguments: `{"path":"/a"}`})
-	if !strings.Contains(ok, "done") {
-		t.Errorf("allowed call should run, got %q", ok)
+	ok := a.executeOne(context.Background(), provider.ToolCall{Name: "read_file", Arguments: `{"path":"/a"}`})
+	if !strings.Contains(ok.output, "done") {
+		t.Errorf("allowed call should run, got %q", ok.output)
 	}
 
 	if len(g.checked) != 2 {
@@ -60,9 +60,9 @@ func TestNilGateRunsEverything(t *testing.T) {
 	reg := tool.NewRegistry()
 	reg.Add(fakeTool{name: "write_file", readOnly: false})
 
-	a := New(nil, reg, NewSession(""), Options{}, io.Discard) // no Gate
-	out, _ := a.executeOne(context.Background(), provider.ToolCall{Name: "write_file", Arguments: `{"path":"/a"}`})
-	if strings.HasPrefix(out, "blocked:") {
-		t.Errorf("nil gate should not block: %q", out)
+	a := New(nil, reg, NewSession(""), Options{}, event.Discard) // no Gate
+	out := a.executeOne(context.Background(), provider.ToolCall{Name: "write_file", Arguments: `{"path":"/a"}`})
+	if strings.HasPrefix(out.output, "blocked:") {
+		t.Errorf("nil gate should not block: %q", out.output)
 	}
 }
